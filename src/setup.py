@@ -32,6 +32,8 @@ setup(
             'yaw_command_publisher = waypoint_follower_pkg.yaw_command_publisher:main',
             'sim_erp_bridge   = waypoint_follower_pkg.sim_erp_bridge:main',
             'cone_info_debug_pub = waypoint_follower_pkg.cone_info_debug_pub:main',
+            'colorway = waypoint_follower_pkg.colorway:main',
+            'controll = waypoint_follower_pkg.controll:main',
         ],
     },
 )
