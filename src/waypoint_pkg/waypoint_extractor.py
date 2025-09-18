@@ -6,69 +6,145 @@ from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 
-from interfaces_pkg.msg import ErpStatusMsg1
-from interfaces_pkg.msg import  ConeInfoArray  # ← 입력 타입 변경
+from interfaces_control_pkg.msg import ErpStatusMsg
+from interfaces_pkg.msg import ConeInfoArray
+
 
 class WaypointExtractor(Node):
     def __init__(self):
         super().__init__('waypoint_extractor')
 
-        # params
-        self.centroid_threshold = 5.0
+        # ===== params =====
+        self.centroid_threshold = 3.0
         self.default_offset = 1.5
         self.frame_id = "velodyne"
         self.left_color = "blue"
         self.right_color = "yellow"
         self.steering_angle_deg = 0.0
 
-        # subs
-        self.centroid_sub = self.create_subscription(
-          ConeInfoArray, '/cones/cone_info_down', self.centroid_callback, 10
-        )
-        self.steering_angle_sub = self.create_subscription(
-            ErpStatusMsg1, '/erp42_status', self.steering_angle_callback, 10
-        )
+        # 주기 / 동기화
+        self.process_hz = 10.0
+        self.sync_timeout_sec = 0.2   # 좌/우 최신 데이터 간 허용 지연
+        self._last_pub_time = None
 
-        # pubs
+        # ===== state (caches) =====
+        self._left_pts = []
+        self._right_pts = []
+        self._t_left = None
+        self._t_right = None
+
+        # ===== subs =====
+        # 양쪽 토픽을 같은 콜백으로 받되, "발행"은 하지 않고 캐시만 갱신
+        self.create_subscription(ConeInfoArray, '/cones/cone_info_left',  self._cones_callback, 10)
+        self.create_subscription(ConeInfoArray, '/cones/cone_info_right', self._cones_callback, 10)
+        self.create_subscription(ErpStatusMsg, '/erp42_status', self.steering_angle_callback, 10)
+
+        # ===== pubs =====
         self.path_pub = self.create_publisher(Path, '/waypoint_path', 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/waypoint_markers', 10)
 
-    def steering_angle_callback(self, msg: ErpStatusMsg1):
+        # 타이머: 한 번만 계산/발행
+        self.create_timer(1.0 / self.process_hz, self._on_timer)
+
+    # ---------------- Callbacks ----------------
+    def steering_angle_callback(self, msg: ErpStatusMsg):
         self.steering_angle_deg = (msg.steer / 2000.0) * 30.0
 
-    def centroid_callback(self, msg:  ConeInfoArray):
-        left, right = [], []
-        self.get_logger().info(f"left : {left}, left : {right}")
+    def _cones_callback(self, msg: ConeInfoArray):
+        """좌/우 토픽 모두 이 콜백으로 들어옴. 여기서는 캐시만 갱신하고 발행은 하지 않음."""
+        now = self.get_clock().now()
 
-        for c in msg.cones:
-            dist = math.sqrt(c.x**2 + c.y**2)
+        # 메시지 안에서 양쪽 색을 모두 뽑아 캐시 갱신 (YOLO 색 뒤바뀜 대비)
+        left = [
+            Point(x=c.x, y=c.y, z=0.0)
+            for c in msg.cones
+            if c.cone_color == self.left_color and math.hypot(c.x, c.y) <= self.centroid_threshold
+        ]
+        right = [
+            Point(x=c.x, y=c.y, z=0.0)
+            for c in msg.cones
+            if c.cone_color == self.right_color and math.hypot(c.x, c.y) <= self.centroid_threshold
+        ]
 
-            if dist > self.centroid_threshold:
-                continue
-            if c.cone_color == self.left_color:
-                left.append(Point(x=c.x, y=c.y, z=0.0))
-            elif c.cone_color == self.right_color:
-                right.append(Point(x=c.x, y=c.y, z=0.0))
+        if left:
+            left.sort(key=lambda p: p.x)
+            self._left_pts = left
+            self._t_left = now
+        if right:
+            right.sort(key=lambda p: p.x)
+            self._right_pts = right
+            self._t_right = now
 
-        left.sort(key=lambda p: p.x)
-        right.sort(key=lambda p: p.x)
+    # ---------------- Timer = single publish per tick ----------------
+    def _on_timer(self):
+        now = self.get_clock().now()
 
-        if left and right:
-            waypoints = [Point(x=(l.x+r.x)/2.0, y=(l.y+r.y)/2.0, z=0.0)
-                         for l, r in zip(left, right)]
-        elif left:
-            waypoints = [Point(x=p.x, y=p.y + self.default_offset, z=0.0) for p in left[1:]]
-            self.get_logger().warn("Only left cones detected; offset path used.")
-        elif right:
-            waypoints = [Point(x=p.x, y=p.y - self.default_offset, z=0.0) for p in right[1:]]
-            self.get_logger().warn("Only right cones detected; offset path used.")
-        else:
-            self.get_logger().warn("No cones after filtering.")
+        # 최근 좌/우 데이터 신선도 확인
+        def fresh(t):
+            if t is None:
+                return False
+            return (now - t).nanoseconds * 1e-9 <= self.sync_timeout_sec
+
+        left_fresh = fresh(self._t_left)
+        right_fresh = fresh(self._t_right)
+
+        # 아무 데이터도 없으면 패스
+        if not left_fresh and not right_fresh:
             return
 
-        self.publish_markers(waypoints)
-        self.publish_path(waypoints)
+        # 좌/우 데이터 선택
+        left = self._left_pts if left_fresh else []
+        right = self._right_pts if right_fresh else []
 
+        waypoints = self._build_waypoints(left, right)
+
+        # 중복 제거(좌표를 2cm 해상도로 라운딩)
+        uniq = []
+        seen = set()
+        for p in waypoints:
+            key = (round(p.x, 2), round(p.y, 2))
+            if key not in seen:
+                uniq.append(p)
+                seen.add(key)
+
+        # 발행 (이 타이머에서만!)
+        self.publish_markers(uniq)
+        self.publish_path(uniq)
+        self._last_pub_time = now
+
+    # ---------------- Core logic ----------------
+    def _build_waypoints(self, left, right):
+        waypoints = []
+
+        if left and right:
+            # 둘 다 있을 때: 왼쪽 기준 가까운 오른쪽을 찾아 중점
+            for base in left:
+                candidates = [
+                    p for p in right
+                    if p.y > base.y and math.hypot(p.x - base.x, p.y - base.y) <= 4.0
+                ]
+                if candidates:
+                    closest = min(candidates, key=lambda p: math.hypot(p.x - base.x, p.y - base.y))
+                    mx = (base.x + closest.x) / 2.0
+                    my = (base.y + closest.y) / 2.0
+                    waypoints.append(Point(x=mx, y=my, z=0.0))
+                else:
+                    # 오른쪽이 비었으면 왼쪽에서 +오프셋
+                    waypoints.append(Point(x=base.x, y=base.y + self.default_offset, z=0.0))
+        elif left and not right:
+            # 왼쪽만 있을 때: +오프셋
+            for base in left:
+                waypoints.append(Point(x=base.x, y=base.y + self.default_offset, z=0.0))
+        elif right and not left:
+            # 오른쪽만 있을 때: -오프셋 (좌표계에 따라 부호 필요시 반대로)
+            for base in right:
+                waypoints.append(Point(x=base.x, y=base.y - self.default_offset, z=0.0))
+        else:
+            pass
+
+        return waypoints
+
+    # ---------------- Publishers ----------------
     def publish_path(self, points):
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
@@ -82,7 +158,6 @@ class WaypointExtractor(Node):
             path.poses.append(ps)
 
         self.path_pub.publish(path)
-        self.get_logger().info(f"Published Path: {len(points)} points")
 
     def publish_markers(self, waypoints):
         marker_array = MarkerArray()
@@ -105,6 +180,7 @@ class WaypointExtractor(Node):
 
         self.marker_pub.publish(marker_array)
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = WaypointExtractor()
@@ -112,6 +188,6 @@ def main(args=None):
     node.destroy_node()
     rclpy.shutdown()
 
+
 if __name__ == '__main__':
     main()
-
